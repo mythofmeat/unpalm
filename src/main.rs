@@ -352,6 +352,137 @@ fn all_slots_blocked(slot_blocked: &HashMap<i32, bool>) -> bool {
     !slot_blocked.is_empty() && slot_blocked.values().all(|&blocked| blocked)
 }
 
+/// Multitouch slot state, mirroring the kernel's per-slot values
+#[derive(Default)]
+struct SlotTracker {
+    current_slot: i32,
+    /// Last known (x, y) per slot. Kept across touches because the kernel only sends
+    /// coordinates that changed, so a new touch can arrive without an X or Y event
+    /// (e.g. repeated touches pinned at the same edge value)
+    positions: HashMap<i32, (Option<i32>, Option<i32>)>,
+    /// slot -> true if the touch in that slot started in an exclusion zone
+    blocked: HashMap<i32, bool>,
+}
+
+impl SlotTracker {
+    /// Process one complete frame (ending in SYN_REPORT) and return the events to forward.
+    /// New touches are checked once the whole frame is known, using the slot's last
+    /// known position for any coordinate the kernel did not resend.
+    fn filter_frame(
+        &mut self,
+        frame: Vec<evdev::InputEvent>,
+        polygons: &[Polygon],
+        block_taps: bool,
+        x_range: (i32, i32),
+        y_range: (i32, i32),
+    ) -> Vec<evdev::InputEvent> {
+        // Pass 1: update slot state and find touches that started or ended
+        let frame_start_slot = self.current_slot;
+        let mut slot = self.current_slot;
+        let mut started = Vec::new();
+        let mut ended = Vec::new();
+        for event in &frame {
+            if let evdev::EventSummary::AbsoluteAxis(_, code, value) = event.destructure() {
+                match code {
+                    AbsoluteAxisCode::ABS_MT_SLOT => slot = value,
+                    AbsoluteAxisCode::ABS_MT_TRACKING_ID => {
+                        if value >= 0 {
+                            ended.retain(|&s| s != slot);
+                            started.push(slot);
+                            self.blocked.insert(slot, false);
+                        } else {
+                            // Keep the slot's blocked state until this frame is filtered
+                            ended.push(slot);
+                        }
+                    }
+                    AbsoluteAxisCode::ABS_MT_POSITION_X => {
+                        self.positions.entry(slot).or_default().0 = Some(value);
+                    }
+                    AbsoluteAxisCode::ABS_MT_POSITION_Y => {
+                        self.positions.entry(slot).or_default().1 = Some(value);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        self.current_slot = slot;
+
+        for s in started {
+            if let Some(&(Some(x), Some(y))) = self.positions.get(&s) {
+                if is_in_any_polygon(to_zone(x, x_range), to_zone(y, y_range), polygons) {
+                    self.blocked.insert(s, true);
+                    log::debug!("Slot {s}: blocked (started at {x}, {y})");
+                }
+            }
+        }
+
+        // Pass 2: drop events belonging to blocked touches
+        let mut slot = frame_start_slot;
+        let mut out = Vec::with_capacity(frame.len());
+        for event in frame {
+            let mut forward = true;
+            let summary = event.destructure();
+            if let evdev::EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_SLOT, value) =
+                summary
+            {
+                slot = value;
+            }
+
+            // Block only slot-specific MT events for blocked slots
+            if self.blocked.get(&slot).copied().unwrap_or(false) {
+                if let evdev::EventSummary::AbsoluteAxis(
+                    _,
+                    AbsoluteAxisCode::ABS_MT_POSITION_X
+                    | AbsoluteAxisCode::ABS_MT_POSITION_Y
+                    | AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR
+                    | AbsoluteAxisCode::ABS_MT_TOUCH_MINOR
+                    | AbsoluteAxisCode::ABS_MT_PRESSURE,
+                    _,
+                ) = summary
+                {
+                    forward = false;
+                }
+            }
+
+            // When --block-taps is enabled and all active slots are blocked,
+            // also block global touch/position events to prevent taps
+            if block_taps && all_slots_blocked(&self.blocked) {
+                match summary {
+                    evdev::EventSummary::AbsoluteAxis(
+                        _,
+                        AbsoluteAxisCode::ABS_X | AbsoluteAxisCode::ABS_Y,
+                        _,
+                    ) => {
+                        forward = false;
+                    }
+                    evdev::EventSummary::Key(
+                        _,
+                        KeyCode::BTN_TOUCH
+                        | KeyCode::BTN_TOOL_FINGER
+                        | KeyCode::BTN_TOOL_DOUBLETAP
+                        | KeyCode::BTN_TOOL_TRIPLETAP
+                        | KeyCode::BTN_TOOL_QUADTAP
+                        | KeyCode::BTN_TOOL_QUINTTAP,
+                        _,
+                    ) => {
+                        forward = false;
+                    }
+                    _ => {}
+                }
+            }
+
+            if forward {
+                out.push(event);
+            }
+        }
+
+        for s in ended {
+            self.blocked.remove(&s);
+        }
+        out
+    }
+}
+
 /// Run the main event loop
 fn run_event_loop(
     device: &mut evdev::Device,
@@ -362,12 +493,9 @@ fn run_event_loop(
     x_range: (i32, i32),
     y_range: (i32, i32),
 ) -> LoopExitReason {
-    // Track multitouch slot state
-    // slot_blocked[slot] = true if touch started in edge zone
-    // slot_positions[slot] = (x, y) - None means not yet known
-    let mut slot_blocked: HashMap<i32, bool> = HashMap::new();
-    let mut slot_positions: HashMap<i32, (Option<i32>, Option<i32>)> = HashMap::new();
-    let mut current_slot: i32 = 0;
+    let mut tracker = SlotTracker::default();
+    // Events of the frame currently being assembled (up to the next SYN_REPORT)
+    let mut frame: Vec<evdev::InputEvent> = Vec::new();
 
     log::info!("Starting event loop...");
 
@@ -407,129 +535,18 @@ fn run_event_loop(
         };
 
         let mut events_to_forward = Vec::new();
-        let mut slots_to_remove = Vec::new();
 
         for event in events {
-            let mut forward = true;
-
-            match event.destructure() {
-                evdev::EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_SLOT, value) => {
-                    current_slot = value;
-                }
-                evdev::EventSummary::AbsoluteAxis(
-                    _,
-                    AbsoluteAxisCode::ABS_MT_TRACKING_ID,
-                    value,
-                ) => {
-                    if value >= 0 {
-                        // New touch started
-                        slot_positions.insert(current_slot, (None, None));
-                        slot_blocked.insert(current_slot, false);
-                    } else {
-                        // Touch ended (tracking_id == -1)
-                        // Defer removal until after processing all events in this batch,
-                        // so that global event blocking decisions see the correct slot state
-                        slots_to_remove.push(current_slot);
-                    }
-                }
-                evdev::EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_X, x) => {
-                    if let Some((old_x, old_y)) = slot_positions.get(&current_slot).copied() {
-                        slot_positions.insert(current_slot, (Some(x), old_y));
-
-                        // Check if this is the first complete position
-                        if old_x.is_none() {
-                            if let Some(y) = old_y {
-                                if is_in_any_polygon(
-                                    to_zone(x, x_range),
-                                    to_zone(y, y_range),
-                                    polygons,
-                                ) {
-                                    slot_blocked.insert(current_slot, true);
-                                    log::debug!(
-                                        "Slot {current_slot}: blocked (started at {x}, {y})"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                evdev::EventSummary::AbsoluteAxis(_, AbsoluteAxisCode::ABS_MT_POSITION_Y, y) => {
-                    if let Some((old_x, old_y)) = slot_positions.get(&current_slot).copied() {
-                        slot_positions.insert(current_slot, (old_x, Some(y)));
-
-                        // Check if this is the first complete position
-                        if old_y.is_none() {
-                            if let Some(x) = old_x {
-                                if is_in_any_polygon(
-                                    to_zone(x, x_range),
-                                    to_zone(y, y_range),
-                                    polygons,
-                                ) {
-                                    slot_blocked.insert(current_slot, true);
-                                    log::debug!(
-                                        "Slot {current_slot}: blocked (started at {x}, {y})"
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
+            let is_report = matches!(
+                event.destructure(),
+                evdev::EventSummary::Synchronization(_, evdev::SynchronizationCode::SYN_REPORT, _)
+            );
+            frame.push(event);
+            if is_report {
+                let complete = std::mem::take(&mut frame);
+                events_to_forward
+                    .extend(tracker.filter_frame(complete, polygons, block_taps, x_range, y_range));
             }
-
-            // Block only slot-specific MT events for blocked slots
-            if slot_blocked.get(&current_slot).copied().unwrap_or(false) {
-                if let evdev::EventSummary::AbsoluteAxis(
-                    _,
-                    AbsoluteAxisCode::ABS_MT_POSITION_X
-                    | AbsoluteAxisCode::ABS_MT_POSITION_Y
-                    | AbsoluteAxisCode::ABS_MT_TOUCH_MAJOR
-                    | AbsoluteAxisCode::ABS_MT_TOUCH_MINOR
-                    | AbsoluteAxisCode::ABS_MT_PRESSURE,
-                    _,
-                ) = event.destructure()
-                {
-                    forward = false;
-                }
-            }
-
-            // When --block-taps is enabled and all active slots are blocked,
-            // also block global touch/position events to prevent taps
-            if block_taps && all_slots_blocked(&slot_blocked) {
-                match event.destructure() {
-                    evdev::EventSummary::AbsoluteAxis(
-                        _,
-                        AbsoluteAxisCode::ABS_X | AbsoluteAxisCode::ABS_Y,
-                        _,
-                    ) => {
-                        forward = false;
-                    }
-                    evdev::EventSummary::Key(
-                        _,
-                        KeyCode::BTN_TOUCH
-                        | KeyCode::BTN_TOOL_FINGER
-                        | KeyCode::BTN_TOOL_DOUBLETAP
-                        | KeyCode::BTN_TOOL_TRIPLETAP
-                        | KeyCode::BTN_TOOL_QUADTAP
-                        | KeyCode::BTN_TOOL_QUINTTAP,
-                        _,
-                    ) => {
-                        forward = false;
-                    }
-                    _ => {}
-                }
-            }
-
-            // Collect events to forward
-            if forward {
-                events_to_forward.push(event);
-            }
-        }
-
-        // Now perform deferred slot cleanup
-        for slot in slots_to_remove {
-            slot_blocked.remove(&slot);
-            slot_positions.remove(&slot);
         }
 
         // Emit all forwarded events as a batch
@@ -889,6 +906,145 @@ mod tests {
         let right = Polygon::rectangle(12043 - 1200, 0, 12043, 7259);
         assert!(right.contains(to_zone(6256, r), 100));
         assert!(right.contains(to_zone(9999, r), 100));
+    }
+
+    fn abs(code: AbsoluteAxisCode, value: i32) -> evdev::InputEvent {
+        evdev::InputEvent::new(evdev::EventType::ABSOLUTE.0, code.0, value)
+    }
+
+    fn syn() -> evdev::InputEvent {
+        evdev::InputEvent::new(
+            evdev::EventType::SYNCHRONIZATION.0,
+            evdev::SynchronizationCode::SYN_REPORT.0,
+            0,
+        )
+    }
+
+    fn has_position(events: &[evdev::InputEvent]) -> bool {
+        events.iter().any(|e| {
+            matches!(
+                e.destructure(),
+                evdev::EventSummary::AbsoluteAxis(
+                    _,
+                    AbsoluteAxisCode::ABS_MT_POSITION_X | AbsoluteAxisCode::ABS_MT_POSITION_Y,
+                    _
+                )
+            )
+        })
+    }
+
+    #[test]
+    fn test_new_touch_without_x_event_is_still_checked() {
+        use AbsoluteAxisCode as A;
+        let (xr, yr) = ((-5787, 6256), (-7102, 157));
+        let zones = vec![Polygon::rectangle(12043 - 1204, 0, 12043, 7259)]; // right 10%
+        let mut t = SlotTracker::default();
+
+        // First touch at the right edge (X pinned to max) is blocked
+        let out = t.filter_frame(
+            vec![
+                abs(A::ABS_MT_TRACKING_ID, 1),
+                abs(A::ABS_MT_POSITION_X, 6256),
+                abs(A::ABS_MT_POSITION_Y, -3000),
+                syn(),
+            ],
+            &zones,
+            false,
+            xr,
+            yr,
+        );
+        assert!(!has_position(&out));
+        t.filter_frame(
+            vec![abs(A::ABS_MT_TRACKING_ID, -1), syn()],
+            &zones,
+            false,
+            xr,
+            yr,
+        );
+
+        // Next touch in the same slot: kernel omits the unchanged X, only Y is sent
+        let out = t.filter_frame(
+            vec![
+                abs(A::ABS_MT_TRACKING_ID, 2),
+                abs(A::ABS_MT_POSITION_Y, -2000),
+                syn(),
+            ],
+            &zones,
+            false,
+            xr,
+            yr,
+        );
+        assert!(
+            !has_position(&out),
+            "touch with inherited edge X must be blocked"
+        );
+        let out = t.filter_frame(
+            vec![abs(A::ABS_MT_POSITION_Y, -1500), syn()],
+            &zones,
+            false,
+            xr,
+            yr,
+        );
+        assert!(
+            !has_position(&out),
+            "movement of blocked touch must stay blocked"
+        );
+        t.filter_frame(
+            vec![abs(A::ABS_MT_TRACKING_ID, -1), syn()],
+            &zones,
+            false,
+            xr,
+            yr,
+        );
+
+        // A touch starting in the middle is forwarded
+        let out = t.filter_frame(
+            vec![
+                abs(A::ABS_MT_TRACKING_ID, 3),
+                abs(A::ABS_MT_POSITION_X, 0),
+                syn(),
+            ],
+            &zones,
+            false,
+            xr,
+            yr,
+        );
+        assert!(has_position(&out));
+    }
+
+    #[test]
+    fn test_slot_switching_within_frame() {
+        use AbsoluteAxisCode as A;
+        let (xr, yr) = ((-5787, 6256), (-7102, 157));
+        let zones = vec![Polygon::rectangle(0, 0, 1204, 7259)]; // left 10%
+        let mut t = SlotTracker::default();
+        // Slot 0 starts in the middle, slot 1 starts at the left edge, same frame
+        let out = t.filter_frame(
+            vec![
+                abs(A::ABS_MT_SLOT, 0),
+                abs(A::ABS_MT_TRACKING_ID, 1),
+                abs(A::ABS_MT_POSITION_X, 0),
+                abs(A::ABS_MT_POSITION_Y, -3000),
+                abs(A::ABS_MT_SLOT, 1),
+                abs(A::ABS_MT_TRACKING_ID, 2),
+                abs(A::ABS_MT_POSITION_X, -5787),
+                abs(A::ABS_MT_POSITION_Y, -3000),
+                syn(),
+            ],
+            &zones,
+            false,
+            xr,
+            yr,
+        );
+        let xs: Vec<i32> = out
+            .iter()
+            .filter_map(|e| match e.destructure() {
+                evdev::EventSummary::AbsoluteAxis(_, A::ABS_MT_POSITION_X, v) => Some(v),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(xs, vec![0]);
+        assert_eq!(t.current_slot, 1);
     }
 
     #[test]

@@ -95,13 +95,15 @@ sudo systemctl start unpalm.service
 
 **Event Loop (`main.rs`, `run_event_loop()`):**
 - Uses `nix::poll()` for non-blocking event reading with signal handling
-- Maintains per-slot state:
-  - `slot_blocked`: HashMap tracking which slots are blocked (started in exclusion zone)
-  - `slot_positions`: HashMap tracking current X/Y position per slot
+- Buffers events into frames (up to SYN_REPORT) and hands each frame to `SlotTracker::filter_frame()`
+- `SlotTracker` maintains per-slot state:
+  - `blocked`: HashMap tracking which slots are blocked (started in exclusion zone)
+  - `positions`: HashMap of last known X/Y per slot, kept across touches (mirrors kernel slot state)
   - `current_slot`: Active multitouch slot
 - Blocks only MT-specific events (ABS_MT_POSITION_X/Y, ABS_MT_TOUCH_MAJOR/MINOR, ABS_MT_PRESSURE)
-- **Critical:** Never blocks ABS_X/ABS_Y (overall pointer position) or slot/tracking_id events
-- Touch blocking logic: When first complete position (X,Y) arrives for a slot, checks if it's in any polygon. If yes, marks slot as blocked permanently until touch ends.
+- **Critical:** Never blocks ABS_X/ABS_Y (overall pointer position) or slot/tracking_id events (unless `--block-taps`, which blocks ABS_X/ABS_Y and BTN_* when all slots are blocked)
+- Touch blocking logic: When a frame starts a new touch, its position (from this frame, or the slot's last known value for coordinates the kernel did not resend) is checked against the polygons. If inside, the slot is blocked until the touch ends.
+- Coordinates are mapped into zone space with `to_zone()`: offset by the axis minimum (axes can be negative) and clamped so touches pinned at the max edge still hit edge zones
 - Returns `LoopExitReason` so `main()` can decide whether to reconnect or shut down
 
 **Virtual Device Creation (inside `setup_device()`):**
@@ -112,10 +114,12 @@ sudo systemctl start unpalm.service
 ### State Machine
 
 Touch lifecycle per slot:
-1. `ABS_MT_TRACKING_ID >= 0`: New touch → Initialize position (None, None), not blocked
-2. `ABS_MT_POSITION_X/Y`: Accumulate position → Once both X and Y are known for the first time, check polygons
-3. If first position is in any polygon → Mark slot blocked
-4. `ABS_MT_TRACKING_ID == -1`: Touch ended → Clear slot state
+1. `ABS_MT_TRACKING_ID >= 0`: New touch → not blocked, check pending until the frame ends
+2. `ABS_MT_POSITION_X/Y`: Update the slot's last known position (kept across touches)
+3. At SYN_REPORT, new touches are checked using the slot's position → Mark slot blocked if in any polygon
+4. `ABS_MT_TRACKING_ID == -1`: Touch ended → Clear blocked state (position is kept)
+
+The kernel only emits coordinates that changed, so a new touch in a slot can arrive without an X or Y event (common at an edge where the value is pinned to the axis max). That is why positions persist across touches and the check waits for the full frame.
 
 ### Signal Handling
 - Uses `signal-hook` for clean SIGINT/SIGTERM handling
