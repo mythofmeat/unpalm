@@ -32,9 +32,10 @@ struct DeviceSetup {
     y_range: (i32, i32),
 }
 
-/// Map a raw coordinate into zone space (0..max-min)
-fn to_zone(value: i32, (min, _max): (i32, i32)) -> i32 {
-    value - min
+/// Map a raw coordinate into zone space (0..max-min), clamping out-of-range values so
+/// touches at or beyond the reported edge still land inside edge zones
+fn to_zone(value: i32, (min, max): (i32, i32)) -> i32 {
+    value.clamp(min, (max - 1).max(min)) - min
 }
 
 /// Palm rejection filter for touchpads
@@ -877,11 +878,17 @@ mod tests {
     }
 
     #[test]
-    fn test_to_zone_negative_range() {
+    fn test_to_zone_negative_range_and_edges() {
         let r = (-5787, 6256);
         assert_eq!(to_zone(-5787, r), 0);
         assert_eq!(to_zone(0, r), 5787);
-        assert_eq!(to_zone(6000, r), 11787);
+        // At or past the reported max must stay inside a right-edge zone (half-open polygons)
+        assert_eq!(to_zone(6256, r), 12042);
+        assert_eq!(to_zone(7000, r), 12042);
+        assert_eq!(to_zone(-9000, r), 0);
+        let right = Polygon::rectangle(12043 - 1200, 0, 12043, 7259);
+        assert!(right.contains(to_zone(6256, r), 100));
+        assert!(right.contains(to_zone(9999, r), 100));
     }
 
     #[test]
