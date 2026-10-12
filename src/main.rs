@@ -27,6 +27,14 @@ enum LoopExitReason {
 struct DeviceSetup {
     device: evdev::Device,
     virtual_device: VirtualDevice,
+    /// Raw axis ranges; zones use coordinates relative to the minimum (some devices have negative ranges)
+    x_range: (i32, i32),
+    y_range: (i32, i32),
+}
+
+/// Map a raw coordinate into zone space (0..max-min)
+fn to_zone(value: i32, (min, _max): (i32, i32)) -> i32 {
+    value - min
 }
 
 /// Palm rejection filter for touchpads
@@ -246,10 +254,19 @@ fn setup_device(
         .or_else(|| absinfo.get(&AbsoluteAxisCode::ABS_Y))
         .ok_or("No Y axis found")?;
 
-    let x_max = x_info.maximum();
-    let y_max = y_info.maximum();
+    let x_range = (x_info.minimum(), x_info.maximum());
+    let y_range = (y_info.minimum(), y_info.maximum());
+    // Zones are built in 0..=(max - min) space so negative axis ranges work
+    let x_max = x_range.1 - x_range.0;
+    let y_max = y_range.1 - y_range.0;
 
-    log::info!("Detected touchpad dimensions: X_MAX={x_max}, Y_MAX={y_max}");
+    log::info!(
+        "Detected touchpad dimensions: X={}..{}, Y={}..{} (width {x_max}, height {y_max})",
+        x_range.0,
+        x_range.1,
+        y_range.0,
+        y_range.1
+    );
 
     // Create virtual device with same capabilities
     let mut builder = VirtualDevice::builder()?
@@ -288,6 +305,8 @@ fn setup_device(
         DeviceSetup {
             device,
             virtual_device,
+            x_range,
+            y_range,
         },
         x_max,
         y_max,
@@ -339,6 +358,8 @@ fn run_event_loop(
     polygons: &[Polygon],
     running: &Arc<AtomicBool>,
     block_taps: bool,
+    x_range: (i32, i32),
+    y_range: (i32, i32),
 ) -> LoopExitReason {
     // Track multitouch slot state
     // slot_blocked[slot] = true if touch started in edge zone
@@ -417,7 +438,11 @@ fn run_event_loop(
                         // Check if this is the first complete position
                         if old_x.is_none() {
                             if let Some(y) = old_y {
-                                if is_in_any_polygon(x, y, polygons) {
+                                if is_in_any_polygon(
+                                    to_zone(x, x_range),
+                                    to_zone(y, y_range),
+                                    polygons,
+                                ) {
                                     slot_blocked.insert(current_slot, true);
                                     log::debug!(
                                         "Slot {current_slot}: blocked (started at {x}, {y})"
@@ -434,7 +459,11 @@ fn run_event_loop(
                         // Check if this is the first complete position
                         if old_y.is_none() {
                             if let Some(x) = old_x {
-                                if is_in_any_polygon(x, y, polygons) {
+                                if is_in_any_polygon(
+                                    to_zone(x, x_range),
+                                    to_zone(y, y_range),
+                                    polygons,
+                                ) {
                                     slot_blocked.insert(current_slot, true);
                                     log::debug!(
                                         "Slot {current_slot}: blocked (started at {x}, {y})"
@@ -645,6 +674,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             &polygons,
             &running,
             cli.block_taps,
+            setup.x_range,
+            setup.y_range,
         ) {
             LoopExitReason::SignalReceived => {
                 log::info!("Shutting down...");
@@ -843,6 +874,14 @@ mod tests {
         assert_eq!(cli.margin_right, Some(10.0));
         assert_eq!(cli.margin_top, Some(15.0));
         assert_eq!(cli.margin_bottom, Some(5.0));
+    }
+
+    #[test]
+    fn test_to_zone_negative_range() {
+        let r = (-5787, 6256);
+        assert_eq!(to_zone(-5787, r), 0);
+        assert_eq!(to_zone(0, r), 5787);
+        assert_eq!(to_zone(6000, r), 11787);
     }
 
     #[test]
